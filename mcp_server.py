@@ -1,660 +1,477 @@
 """
-SecureHR MCP Server - Remote MCP (HTTP/SSE) with RBAC
-Exposes Timecount tools to Claude.ai via Model Context Protocol.
+SecureHR MCP Server — Timecount API Tools with RBAC
 
-Auth: OAuth 2.1 bearer tokens (JWT) in Authorization header
-RBAC: Enforced inside every tool based on authenticated user identity
-Run:  python mcp_server.py  (listens on :8000, mount path /mcp)
-Connect from Claude.ai: Settings -> Connectors -> Add custom MCP server
+This FastMCP server exposes 12 Timecount API tools.
+RBAC is enforced here: every tool receives a `caller_username` argument
+that the FastAPI layer injects into Claude's system prompt so Claude
+always passes it through. The USERS_DB is read from the same
+CHAT_USERS environment variable as the main FastAPI app.
+
+Deploy this as a SEPARATE Railway service. Its URL goes into
+TIMECOUNT_MCP_URL on the main FastAPI service.
 """
 
 import os
-import re
 import json
 import httpx
-from datetime import datetime
-from typing import Optional, Any
-from contextvars import ContextVar
-
-from mcp.server.fastmcp import FastMCP
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from jose import JWTError, jwt
+from typing import Optional
 from dotenv import load_dotenv
+from fastmcp import FastMCP
 
 load_dotenv()
 
-# ============== Config ==============
-TIMECOUNT_API_URL = os.getenv("TIMECOUNT_API_URL", "https://tutorial.formatgold.de/api")
+# ── Config ────────────────────────────────────────────────────────────────────
+TIMECOUNT_API_URL   = os.getenv("TIMECOUNT_API_URL", "https://tutorial.formatgold.de/api")
 TIMECOUNT_API_TOKEN = os.getenv("TIMECOUNT_API_TOKEN")
-JWT_SECRET = os.getenv("JWT_SECRET")
-JWT_ALGORITHM = "HS256"
+MCP_PORT            = int(os.getenv("MCP_PORT", 8001))
 
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET not set")
+if not TIMECOUNT_API_TOKEN:
+    raise RuntimeError("TIMECOUNT_API_TOKEN env var is required.")
 
-# Same user format as before: username:password:employee_id:role:department_id
-def parse_users():
-    users_str = os.getenv("CHAT_USERS", "")
-    if not users_str:
-        raise RuntimeError("CHAT_USERS not set")
-    users = {}
-    for row in users_str.split(","):
-        parts = row.split(":")
-        if len(parts) >= 2:
-            users[parts[0].strip()] = {
-                "employee_id": parts[2].strip() if len(parts) > 2 and parts[2].strip() else None,
-                "role": parts[3].strip() if len(parts) > 3 and parts[3].strip() else "employee",
-                "department_id": int(parts[4].strip()) if len(parts) > 4 and parts[4].strip() else None,
-            }
-    return users
-
-USERS_DB = parse_users()
-
-# ============== Per-request auth context ==============
-# MCP tools are called in request scope — we stash the authenticated user here
-current_user_ctx: ContextVar[Optional[dict]] = ContextVar("current_user", default=None)
-
-def get_user() -> dict:
-    """Return {username, employee_id, role, department_id} for the caller."""
-    user = current_user_ctx.get()
-    if not user:
-        raise PermissionError("Not authenticated")
-    return user
-
-# ============== Audit log ==============
-def audit(event: str, details: str, status: str, username: str = "system"):
-    line = f"{datetime.utcnow().isoformat()} | USER={username} | {event} | {details} | {status}\n"
-    try:
-        with open("security_audit.log", "a") as f:
-            f.write(line)
-    except Exception:
-        pass
-    print(f"🔒 [{status}] {event} - {details}")
-
-# ============== RBAC ==============
-def can_access(target_employee_id: str) -> bool:
-    u = get_user()
-    if u["role"] in ("system_admin", "hr_admin"):
-        return True
-    return str(u["employee_id"]) == str(target_employee_id)
-
-def can_admin() -> bool:
-    return get_user()["role"] in ("system_admin", "hr_admin")
-
-def deny(resource: str, action: str):
-    u = get_user()
-    audit("ACCESS_DENIED", f"{action} on {resource}", "BLOCKED", u["username"])
-    raise PermissionError(
-        f"Access denied. You can only {action} your own data (employee_id={u['employee_id']})."
-    )
-
-# ============== Prompt injection filter for string inputs ==============
-INJECTION_PATTERNS = [
-    "ignore previous instructions", "ignore all previous", "disregard previous",
-    "new instructions:", "system prompt", "jailbreak", "you are now",
-    "forget everything", "pretend you are", "bypass security", "disable safety",
-]
-
-def check_injection(value: str, field: str):
-    if not isinstance(value, str):
-        return
-    low = value.lower()
-    for p in INJECTION_PATTERNS:
-        if p in low:
-            u = get_user()
-            audit("PROMPT_INJECTION", f"field={field} pattern={p}", "BLOCKED", u["username"])
-            raise ValueError(f"Suspicious content in field '{field}'. Please rephrase.")
-
-# ============== Timecount HTTP client ==============
-tc = httpx.AsyncClient(
+# ── Shared HTTP client (created once at module load) ──────────────────────────
+_http = httpx.AsyncClient(
     base_url=TIMECOUNT_API_URL,
     headers={"Authorization": f"Bearer {TIMECOUNT_API_TOKEN}"},
     timeout=30.0,
 )
 
-# ============== MCP server ==============
-mcp = FastMCP("SecureHR-Timecount")
-
-# ---------- READ tools ----------
-
-@mcp.tool()
-async def get_employee_by_id(employee_id: str) -> dict:
-    """Get detailed information about a specific employee. Employees can only fetch their own record; admins can fetch anyone."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}", "view")
-    r = await tc.get(f"/employees/{employee_id}")
-    r.raise_for_status()
-    audit("READ_EMPLOYEE", f"id={employee_id}", "SUCCESS", get_user()["username"])
-    return r.json()
-
-@mcp.tool()
-async def get_my_employee() -> dict:
-    """Get the current authenticated user's employee record. Convenience tool — no ID needed."""
-    u = get_user()
-    if not u["employee_id"]:
-        raise ValueError("Your account is not linked to an employee record.")
-    r = await tc.get(f"/employees/{u['employee_id']}")
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def search_employees(query: str) -> dict:
-    """Search employees by name or token. Non-admins only see themselves in results."""
-    check_injection(query, "query")
-    u = get_user()
-    if not can_admin():
-        # filter: only return self if matches
-        if not u["employee_id"]:
-            return {"data": []}
-        r = await tc.get(f"/employees/{u['employee_id']}")
-        r.raise_for_status()
-        emp = r.json()
-        name = f"{emp.get('first_name','')} {emp.get('last_name','')}".lower()
-        if query.lower() in name:
-            return {"data": [emp]}
-        return {"data": []}
-    r = await tc.get(f"/employees/search/{query}")
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def list_employees(visibility: str = "all") -> dict:
-    """List all employees. Admin-only; non-admins get their own record only."""
-    u = get_user()
-    if not can_admin():
-        if not u["employee_id"]:
-            return {"data": []}
-        r = await tc.get(f"/employees/{u['employee_id']}")
-        r.raise_for_status()
-        return {"data": [r.json()]}
-    r = await tc.get("/employees", params={"filter[employee_visibility]": visibility})
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def get_employee_summary(employee_id: str) -> dict:
-    """Get vacation/hours summary for an employee. RBAC-enforced."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}/summary", "view")
-    r = await tc.get(f"/employees/{employee_id}/summary")
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def get_employee_time_balances(employee_id: str, range_begin: str, range_end: str) -> dict:
-    """Get time balances within a date range (YYYY-MM-DD). RBAC-enforced."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}/time_balances", "view")
-    r = await tc.get(
-        f"/employees/{employee_id}/time_balances",
-        params={"filter[range_begin]": range_begin, "filter[range_end]": range_end},
-    )
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def get_monthly_hours() -> dict:
-    """Monthly hours aggregate across all employees. Admin-only."""
-    if not can_admin():
-        deny("monthly_hours", "view")
-    r = await tc.get("/employees/months")
-    r.raise_for_status()
-    return r.json()
-
-# ---------- WRITE tools ----------
-
-@mcp.tool()
-async def update_employee(employee_id: str, fields: dict) -> dict:
-    """Update employee fields (PATCH). Pass any subset of: first_name, last_name, street, street_no,
-    zipcode, place, country, mobile, email, civil_state_id, account_number, bank_id, etc.
-    RBAC: employees can only edit their own record; admins can edit anyone."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}", "edit")
-    # scrub strings for injection
-    for k, v in fields.items():
-        if isinstance(v, str):
-            check_injection(v, k)
-    data = {k: v for k, v in fields.items() if v is not None}
-    r = await tc.patch(f"/employees/{employee_id}", json=data)
-    r.raise_for_status()
-    audit("EMPLOYEE_UPDATED", f"id={employee_id} fields={list(data.keys())}", "SUCCESS", get_user()["username"])
-    return r.json()
-
-@mcp.tool()
-async def create_employee(fields: dict) -> dict:
-    """Create a new employee. Admin-only. Requires at least first_name, last_name, department_id."""
-    if not can_admin():
-        deny("employee:new", "create")
-    for k, v in fields.items():
-        if isinstance(v, str):
-            check_injection(v, k)
-    data = {k: v for k, v in fields.items() if v is not None}
-    r = await tc.post("/employees", json=data)
-    r.raise_for_status()
-    result = r.json()
-    audit("EMPLOYEE_CREATED", f"id={result.get('id')}", "SUCCESS", get_user()["username"])
-    return result
-
-@mcp.tool()
-async def delete_employee(employee_id: str) -> dict:
-    """Delete an employee permanently. Admin-only."""
-    if not can_admin():
-        deny(f"employee:{employee_id}", "delete")
-    r = await tc.delete(f"/employees/{employee_id}")
-    if r.status_code == 204:
-        audit("EMPLOYEE_DELETED", f"id={employee_id}", "SUCCESS", get_user()["username"])
-        return {"success": True, "message": f"Employee {employee_id} deleted"}
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def check_employee_deletable(employee_id: str) -> dict:
-    """Check whether an employee can be safely deleted. Admin-only."""
-    if not can_admin():
-        deny(f"employee:{employee_id}", "check_deletable")
-    r = await tc.get(f"/employees/deletable/{employee_id}")
-    r.raise_for_status()
-    return r.json()
-
-# ---------- PROJECTS ----------
-
-@mcp.tool()
-async def list_projects(visibility: Optional[int] = None) -> dict:
-    """List projects. Accessible to all authenticated users."""
-    params = {"filter[visibility]": visibility} if visibility is not None else {}
-    r = await tc.get("/projects/range", params=params)
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def get_project_by_id(project_id: str) -> dict:
-    """Get a project by ID."""
-    r = await tc.get(f"/projects/range/{project_id}")
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def search_projects(query: str) -> dict:
-    """Search projects."""
-    check_injection(query, "query")
-    r = await tc.get(f"/projects/range/search/{query}")
-    r.raise_for_status()
-    return r.json()
-
-# ============== Auth middleware ==============
-# Validates JWT Bearer token on every MCP request and populates the context var.
-
-class JWTAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Allow unauthenticated access to discovery / health
-        if request.url.path in ("/health",) or request.url.path.startswith("/.well-known"):
-            return await call_next(request)
-
-        auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer "):
-            return JSONResponse({"error": "missing bearer token"}, status_code=401)
-
-        token = auth[7:]
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            username = payload.get("sub")
-            if not username or username not in USERS_DB:
-                return JSONResponse({"error": "invalid token"}, status_code=401)
-            if payload.get("type") == "temp":
-                return JSONResponse({"error": "2FA not completed"}, status_code=401)
-        except JWTError:
-            return JSONResponse({"error": "invalid token"}, status_code=401)
-
-        user_record = USERS_DB[username]
-        token_ctx = current_user_ctx.set({"username": username, **user_record})
-        try:
-            response = await call_next(request)
-        finally:
-            current_user_ctx.reset(token_ctx)
-        return response
-
-# ============== Mount as ASGI app ==============
-app = mcp.streamable_http_app()
-app.add_middleware(JWTAuthMiddleware)
-
-@app.route("/health")
-async def health(request):
-    return JSONResponse({"status": "ok", "users": list(USERS_DB.keys())})
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    print(f"🚀 SecureHR MCP server on :{port}/mcp")
-    uvicorn.run(app, host="0.0.0.0", port=port)
-"""
-SecureHR MCP Server - Remote MCP (HTTP/SSE) with RBAC
-Exposes Timecount tools to Claude.ai via Model Context Protocol.
-
-Auth: OAuth 2.1 bearer tokens (JWT) in Authorization header
-RBAC: Enforced inside every tool based on authenticated user identity
-Run:  python mcp_server.py  (listens on :8000, mount path /mcp)
-Connect from Claude.ai: Settings -> Connectors -> Add custom MCP server
-"""
-
-import os
-import re
-import json
-import httpx
-from datetime import datetime
-from typing import Optional, Any
-from contextvars import ContextVar
-
-from mcp.server.fastmcp import FastMCP
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from jose import JWTError, jwt
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ============== Config ==============
-TIMECOUNT_API_URL = os.getenv("TIMECOUNT_API_URL", "https://tutorial.formatgold.de/api")
-TIMECOUNT_API_TOKEN = os.getenv("TIMECOUNT_API_TOKEN")
-JWT_SECRET = os.getenv("JWT_SECRET")
-JWT_ALGORITHM = "HS256"
-
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET not set")
-
-# Same user format as before: username:password:employee_id:role:department_id
-def parse_users():
-    users_str = os.getenv("CHAT_USERS", "")
-    if not users_str:
-        raise RuntimeError("CHAT_USERS not set")
-    users = {}
-    for row in users_str.split(","):
-        parts = row.split(":")
-        if len(parts) >= 2:
-            users[parts[0].strip()] = {
-                "employee_id": parts[2].strip() if len(parts) > 2 and parts[2].strip() else None,
-                "role": parts[3].strip() if len(parts) > 3 and parts[3].strip() else "employee",
-                "department_id": int(parts[4].strip()) if len(parts) > 4 and parts[4].strip() else None,
-            }
+# ── User DB (same format as main app) ────────────────────────────────────────
+def _parse_users() -> dict:
+    raw = os.getenv("CHAT_USERS", "")
+    users: dict = {}
+    for entry in raw.split(","):
+        parts = entry.strip().split(":")
+        if len(parts) < 2:
+            continue
+        username    = parts[0].strip()
+        password    = parts[1].strip()
+        employee_id = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        role        = parts[3].strip() if len(parts) > 3 and parts[3].strip() else "employee"
+        dept_id     = int(parts[4].strip()) if len(parts) > 4 and parts[4].strip() else None
+        users[username] = {
+            "employee_id": employee_id,
+            "role": role,
+            "department_id": dept_id,
+        }
     return users
 
-USERS_DB = parse_users()
+USERS_DB: dict = _parse_users()
 
-# ============== Per-request auth context ==============
-# MCP tools are called in request scope — we stash the authenticated user here
-current_user_ctx: ContextVar[Optional[dict]] = ContextVar("current_user", default=None)
+# ── RBAC helpers ──────────────────────────────────────────────────────────────
 
-def get_user() -> dict:
-    """Return {username, employee_id, role, department_id} for the caller."""
-    user = current_user_ctx.get()
-    if not user:
-        raise PermissionError("Not authenticated")
-    return user
+def _get_role(username: str) -> str:
+    return USERS_DB.get(username, {}).get("role", "employee")
 
-# ============== Audit log ==============
-def audit(event: str, details: str, status: str, username: str = "system"):
-    line = f"{datetime.utcnow().isoformat()} | USER={username} | {event} | {details} | {status}\n"
-    try:
-        with open("security_audit.log", "a") as f:
-            f.write(line)
-    except Exception:
-        pass
-    print(f"🔒 [{status}] {event} - {details}")
+def _get_emp_id(username: str) -> Optional[str]:
+    return USERS_DB.get(username, {}).get("employee_id")
 
-# ============== RBAC ==============
-def can_access(target_employee_id: str) -> bool:
-    u = get_user()
-    if u["role"] in ("system_admin", "hr_admin"):
+def _can_read(username: str, target_id: str) -> bool:
+    role = _get_role(username)
+    if role in ("system_admin", "hr_admin"):
         return True
-    return str(u["employee_id"]) == str(target_employee_id)
+    return str(_get_emp_id(username)) == str(target_id)
 
-def can_admin() -> bool:
-    return get_user()["role"] in ("system_admin", "hr_admin")
+def _can_write(username: str, target_id: str) -> bool:
+    return _can_read(username, target_id)   # same rules for now
 
-def deny(resource: str, action: str):
-    u = get_user()
-    audit("ACCESS_DENIED", f"{action} on {resource}", "BLOCKED", u["username"])
-    raise PermissionError(
-        f"Access denied. You can only {action} your own data (employee_id={u['employee_id']})."
-    )
+def _is_admin(username: str) -> bool:
+    return _get_role(username) in ("system_admin", "hr_admin")
 
-# ============== Prompt injection filter for string inputs ==============
-INJECTION_PATTERNS = [
-    "ignore previous instructions", "ignore all previous", "disregard previous",
-    "new instructions:", "system prompt", "jailbreak", "you are now",
-    "forget everything", "pretend you are", "bypass security", "disable safety",
-]
+def _deny(action: str, username: str, resource: str) -> dict:
+    print(f"🔒 RBAC DENIED | user={username} action={action} resource={resource}")
+    return {
+        "error": "Access denied",
+        "message": (
+            f"You are not authorised to {action} {resource}. "
+            f"Your employee ID is: {_get_emp_id(username)}"
+        ),
+    }
 
-def check_injection(value: str, field: str):
-    if not isinstance(value, str):
-        return
-    low = value.lower()
-    for p in INJECTION_PATTERNS:
-        if p in low:
-            u = get_user()
-            audit("PROMPT_INJECTION", f"field={field} pattern={p}", "BLOCKED", u["username"])
-            raise ValueError(f"Suspicious content in field '{field}'. Please rephrase.")
+def _log(username: str, action: str, detail: str = ""):
+    print(f"📋 AUDIT | user={username} action={action} {detail}")
 
-# ============== Timecount HTTP client ==============
-tc = httpx.AsyncClient(
-    base_url=TIMECOUNT_API_URL,
-    headers={"Authorization": f"Bearer {TIMECOUNT_API_TOKEN}"},
-    timeout=30.0,
-)
-
-# ============== MCP server ==============
+# ── FastMCP app ───────────────────────────────────────────────────────────────
 mcp = FastMCP("SecureHR-Timecount")
 
-# ---------- READ tools ----------
+# ══════════════════════════════════════════════════════════════════════════════
+# EMPLOYEE TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_employee_by_id(employee_id: str) -> dict:
-    """Get detailed information about a specific employee. Employees can only fetch their own record; admins can fetch anyone."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}", "view")
-    r = await tc.get(f"/employees/{employee_id}")
-    r.raise_for_status()
-    audit("READ_EMPLOYEE", f"id={employee_id}", "SUCCESS", get_user()["username"])
-    return r.json()
+async def get_employees(caller_username: str, visibility: str = "all") -> dict:
+    """
+    Get a list of employees from Timecount.
+    Admins get all employees; regular employees only see their own record.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        visibility: Filter — 'all', '0' (hidden), or '1' (visible).
+    """
+    _log(caller_username, "get_employees", f"visibility={visibility}")
+
+    if not _is_admin(caller_username):
+        # Non-admins: return only own record
+        emp_id = _get_emp_id(caller_username)
+        if not emp_id:
+            return {"error": "Your account is not linked to an employee record."}
+        resp = await _http.get(f"/employees/{emp_id}")
+        resp.raise_for_status()
+        return {"data": [resp.json()]}
+
+    params = {}
+    if visibility != "all":
+        params["filter[employee_visibility]"] = visibility
+    resp = await _http.get("/employees", params=params)
+    resp.raise_for_status()
+    return resp.json()
+
 
 @mcp.tool()
-async def get_my_employee() -> dict:
-    """Get the current authenticated user's employee record. Convenience tool — no ID needed."""
-    u = get_user()
-    if not u["employee_id"]:
-        raise ValueError("Your account is not linked to an employee record.")
-    r = await tc.get(f"/employees/{u['employee_id']}")
-    r.raise_for_status()
-    return r.json()
+async def search_employees(caller_username: str, query: str) -> dict:
+    """
+    Search for employees by name or token.
+    Admins search all; employees only see matches against their own record.
 
-@mcp.tool()
-async def search_employees(query: str) -> dict:
-    """Search employees by name or token. Non-admins only see themselves in results."""
-    check_injection(query, "query")
-    u = get_user()
-    if not can_admin():
-        # filter: only return self if matches
-        if not u["employee_id"]:
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        query: Name or token to search for.
+    """
+    _log(caller_username, "search_employees", f"query={query}")
+
+    if not _is_admin(caller_username):
+        emp_id = _get_emp_id(caller_username)
+        if not emp_id:
             return {"data": []}
-        r = await tc.get(f"/employees/{u['employee_id']}")
-        r.raise_for_status()
-        emp = r.json()
-        name = f"{emp.get('first_name','')} {emp.get('last_name','')}".lower()
-        if query.lower() in name:
+        resp = await _http.get(f"/employees/{emp_id}")
+        resp.raise_for_status()
+        emp = resp.json()
+        full_name = f"{emp.get('first_name','')} {emp.get('last_name','')}".lower()
+        if query.lower() in full_name or query.lower() in str(emp.get("employee_number", "")):
             return {"data": [emp]}
         return {"data": []}
-    r = await tc.get(f"/employees/search/{query}")
-    r.raise_for_status()
-    return r.json()
+
+    resp = await _http.get(f"/employees/search/{query}")
+    resp.raise_for_status()
+    return resp.json()
+
 
 @mcp.tool()
-async def list_employees(visibility: str = "all") -> dict:
-    """List all employees. Admin-only; non-admins get their own record only."""
-    u = get_user()
-    if not can_admin():
-        if not u["employee_id"]:
-            return {"data": []}
-        r = await tc.get(f"/employees/{u['employee_id']}")
-        r.raise_for_status()
-        return {"data": [r.json()]}
-    r = await tc.get("/employees", params={"filter[employee_visibility]": visibility})
-    r.raise_for_status()
-    return r.json()
+async def get_employee_by_id(caller_username: str, employee_id: str) -> dict:
+    """
+    Get detailed information about a specific employee by their ID.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID.
+    """
+    if not _can_read(caller_username, employee_id):
+        return _deny("read", caller_username, f"employee {employee_id}")
+
+    _log(caller_username, "get_employee_by_id", f"id={employee_id}")
+    resp = await _http.get(f"/employees/{employee_id}")
+    resp.raise_for_status()
+    return resp.json()
+
 
 @mcp.tool()
-async def get_employee_summary(employee_id: str) -> dict:
-    """Get vacation/hours summary for an employee. RBAC-enforced."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}/summary", "view")
-    r = await tc.get(f"/employees/{employee_id}/summary")
-    r.raise_for_status()
-    return r.json()
+async def get_employee_by_token(caller_username: str, token: str) -> dict:
+    """
+    Get detailed information about a specific employee by their token.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        token: The employee's token string.
+    """
+    _log(caller_username, "get_employee_by_token", f"token={token}")
+    # Fetch first, then RBAC-check on returned ID
+    resp = await _http.get(f"/employees/token/{token}")
+    resp.raise_for_status()
+    emp = resp.json()
+    emp_id = str(emp.get("id", ""))
+    if not _can_read(caller_username, emp_id):
+        return _deny("read", caller_username, f"employee token={token}")
+    return emp
+
 
 @mcp.tool()
-async def get_employee_time_balances(employee_id: str, range_begin: str, range_end: str) -> dict:
-    """Get time balances within a date range (YYYY-MM-DD). RBAC-enforced."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}/time_balances", "view")
-    r = await tc.get(
+async def update_employee(
+    caller_username: str,
+    employee_id: str,
+    # Personal
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    title: Optional[str] = None,
+    gender: Optional[int] = None,
+    birth_date: Optional[str] = None,
+    birth_place: Optional[str] = None,
+    birth_name: Optional[str] = None,
+    nationality: Optional[str] = None,
+    civil_state_id: Optional[str] = None,
+    # Contact
+    mobile: Optional[str] = None,
+    phone: Optional[str] = None,
+    email: Optional[str] = None,
+    # Address
+    street: Optional[str] = None,
+    street_no: Optional[str] = None,
+    zipcode: Optional[str] = None,
+    place: Optional[str] = None,
+    country: Optional[str] = None,
+    address_addon: Optional[str] = None,
+    # Banking
+    account_number: Optional[str] = None,
+    bank_id: Optional[str] = None,
+    payment_method: Optional[int] = None,
+    alternative_account_holder: Optional[str] = None,
+    # Employment
+    department_id: Optional[int] = None,
+    employment_id: Optional[str] = None,
+    visibility: Optional[int] = None,
+    first_entry_date: Optional[str] = None,
+    discharge_date: Optional[str] = None,
+    # Tax / Insurance
+    social_security_number: Optional[str] = None,
+    tax_identification_number: Optional[str] = None,
+    # Other
+    work_permit: Optional[str] = None,
+    own_car: Optional[int] = None,
+    datev_id: Optional[str] = None,
+) -> dict:
+    """
+    Update an employee record (partial PATCH). Only include fields to change.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID (required).
+        (all other args): Fields to update — omit to leave unchanged.
+    """
+    if not _can_write(caller_username, employee_id):
+        return _deny("edit", caller_username, f"employee {employee_id}")
+
+    # Build payload — only non-None values
+    payload = {k: v for k, v in {
+        "first_name": first_name, "last_name": last_name, "title": title,
+        "gender": gender, "birth_date": birth_date, "birth_place": birth_place,
+        "birth_name": birth_name, "nationality": nationality,
+        "civil_state_id": civil_state_id,
+        "mobile": mobile, "phone": phone, "email": email,
+        "street": street, "street_no": street_no, "zipcode": zipcode,
+        "place": place, "country": country, "address_addon": address_addon,
+        "account_number": account_number, "bank_id": bank_id,
+        "payment_method": payment_method,
+        "alternative_account_holder": alternative_account_holder,
+        "department_id": department_id, "employment_id": employment_id,
+        "visibility": visibility, "first_entry_date": first_entry_date,
+        "discharge_date": discharge_date,
+        "social_security_number": social_security_number,
+        "tax_identification_number": tax_identification_number,
+        "work_permit": work_permit, "own_car": own_car, "datev_id": datev_id,
+    }.items() if v is not None}
+
+    _log(caller_username, "update_employee", f"id={employee_id} fields={list(payload.keys())}")
+    resp = await _http.patch(f"/employees/{employee_id}", json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def create_employee(
+    caller_username: str,
+    first_name: str,
+    last_name: str,
+    department_id: int,
+    title: Optional[str] = None,
+    gender: Optional[int] = None,
+    birth_date: Optional[str] = None,
+    nationality: Optional[str] = None,
+    street: Optional[str] = None,
+    street_no: Optional[str] = None,
+    zipcode: Optional[str] = None,
+    place: Optional[str] = None,
+    country: Optional[str] = None,
+    mobile: Optional[str] = None,
+    email: Optional[str] = None,
+    account_number: Optional[str] = None,
+    employment_id: Optional[str] = None,
+    first_entry_date: Optional[str] = None,
+    visibility: int = 1,
+) -> dict:
+    """
+    Create a new employee. Requires hr_admin or system_admin role.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        first_name: Employee first name (required).
+        last_name: Employee last name (required).
+        department_id: Primary department ID (required).
+        (all other args): Optional fields.
+    """
+    if not _is_admin(caller_username):
+        return _deny("create", caller_username, "employee records")
+
+    payload = {k: v for k, v in {
+        "first_name": first_name, "last_name": last_name,
+        "department_id": department_id, "title": title, "gender": gender,
+        "birth_date": birth_date, "nationality": nationality,
+        "street": street, "street_no": street_no, "zipcode": zipcode,
+        "place": place, "country": country, "mobile": mobile, "email": email,
+        "account_number": account_number, "employment_id": employment_id,
+        "first_entry_date": first_entry_date, "visibility": visibility,
+    }.items() if v is not None}
+
+    _log(caller_username, "create_employee", f"name={first_name} {last_name}")
+    resp = await _http.post("/employees", json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def delete_employee(caller_username: str, employee_id: str) -> dict:
+    """
+    Permanently delete an employee. Requires hr_admin or system_admin role.
+    Use check_employee_deletable first.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID.
+    """
+    if not _is_admin(caller_username):
+        return _deny("delete", caller_username, f"employee {employee_id}")
+
+    _log(caller_username, "delete_employee", f"id={employee_id}")
+    resp = await _http.delete(f"/employees/{employee_id}")
+    if resp.status_code == 204:
+        return {"success": True, "message": f"Employee {employee_id} deleted."}
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def check_employee_deletable(caller_username: str, employee_id: str) -> dict:
+    """
+    Check whether an employee can be safely deleted before attempting deletion.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID.
+    """
+    if not _is_admin(caller_username):
+        return _deny("check-delete", caller_username, f"employee {employee_id}")
+
+    _log(caller_username, "check_employee_deletable", f"id={employee_id}")
+    resp = await _http.get(f"/employees/deletable/{employee_id}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def get_employee_summary(caller_username: str, employee_id: str) -> dict:
+    """
+    Get an employee's summary including vacation and hours overview.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID.
+    """
+    if not _can_read(caller_username, employee_id):
+        return _deny("read summary of", caller_username, f"employee {employee_id}")
+
+    _log(caller_username, "get_employee_summary", f"id={employee_id}")
+    resp = await _http.get(f"/employees/{employee_id}/summary")
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROJECT TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def get_projects(caller_username: str, visibility: Optional[int] = None) -> dict:
+    """
+    Get all projects. Available to all authenticated users.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        visibility: Optional filter — 0=hidden, 1=visible.
+    """
+    _log(caller_username, "get_projects")
+    params = {}
+    if visibility is not None:
+        params["filter[visibility]"] = visibility
+    resp = await _http.get("/projects/range", params=params)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def get_project_by_id(caller_username: str, project_id: str) -> dict:
+    """
+    Get detailed information about a specific project.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        project_id: The project's ID.
+    """
+    _log(caller_username, "get_project_by_id", f"id={project_id}")
+    resp = await _http.get(f"/projects/range/{project_id}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.tool()
+async def search_projects(caller_username: str, query: str) -> dict:
+    """
+    Search for projects by name or description.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        query: Search term.
+    """
+    _log(caller_username, "search_projects", f"query={query}")
+    resp = await _http.get(f"/projects/range/search/{query}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TIME BALANCE TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def get_employee_time_balances(
+    caller_username: str,
+    employee_id: str,
+    range_begin: str,
+    range_end: str,
+) -> dict:
+    """
+    Get time balance entries for an employee within a date range.
+
+    Args:
+        caller_username: The authenticated username (injected by system prompt).
+        employee_id: The employee's numeric ID.
+        range_begin: Start date in YYYY-MM-DD format.
+        range_end: End date in YYYY-MM-DD format.
+    """
+    if not _can_read(caller_username, employee_id):
+        return _deny("read time balances of", caller_username, f"employee {employee_id}")
+
+    _log(caller_username, "get_employee_time_balances", f"id={employee_id} {range_begin}→{range_end}")
+    resp = await _http.get(
         f"/employees/{employee_id}/time_balances",
         params={"filter[range_begin]": range_begin, "filter[range_end]": range_end},
     )
-    r.raise_for_status()
-    return r.json()
+    resp.raise_for_status()
+    return resp.json()
 
-@mcp.tool()
-async def get_monthly_hours() -> dict:
-    """Monthly hours aggregate across all employees. Admin-only."""
-    if not can_admin():
-        deny("monthly_hours", "view")
-    r = await tc.get("/employees/months")
-    r.raise_for_status()
-    return r.json()
 
-# ---------- WRITE tools ----------
-
-@mcp.tool()
-async def update_employee(employee_id: str, fields: dict) -> dict:
-    """Update employee fields (PATCH). Pass any subset of: first_name, last_name, street, street_no,
-    zipcode, place, country, mobile, email, civil_state_id, account_number, bank_id, etc.
-    RBAC: employees can only edit their own record; admins can edit anyone."""
-    if not can_access(employee_id):
-        deny(f"employee:{employee_id}", "edit")
-    # scrub strings for injection
-    for k, v in fields.items():
-        if isinstance(v, str):
-            check_injection(v, k)
-    data = {k: v for k, v in fields.items() if v is not None}
-    r = await tc.patch(f"/employees/{employee_id}", json=data)
-    r.raise_for_status()
-    audit("EMPLOYEE_UPDATED", f"id={employee_id} fields={list(data.keys())}", "SUCCESS", get_user()["username"])
-    return r.json()
-
-@mcp.tool()
-async def create_employee(fields: dict) -> dict:
-    """Create a new employee. Admin-only. Requires at least first_name, last_name, department_id."""
-    if not can_admin():
-        deny("employee:new", "create")
-    for k, v in fields.items():
-        if isinstance(v, str):
-            check_injection(v, k)
-    data = {k: v for k, v in fields.items() if v is not None}
-    r = await tc.post("/employees", json=data)
-    r.raise_for_status()
-    result = r.json()
-    audit("EMPLOYEE_CREATED", f"id={result.get('id')}", "SUCCESS", get_user()["username"])
-    return result
-
-@mcp.tool()
-async def delete_employee(employee_id: str) -> dict:
-    """Delete an employee permanently. Admin-only."""
-    if not can_admin():
-        deny(f"employee:{employee_id}", "delete")
-    r = await tc.delete(f"/employees/{employee_id}")
-    if r.status_code == 204:
-        audit("EMPLOYEE_DELETED", f"id={employee_id}", "SUCCESS", get_user()["username"])
-        return {"success": True, "message": f"Employee {employee_id} deleted"}
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def check_employee_deletable(employee_id: str) -> dict:
-    """Check whether an employee can be safely deleted. Admin-only."""
-    if not can_admin():
-        deny(f"employee:{employee_id}", "check_deletable")
-    r = await tc.get(f"/employees/deletable/{employee_id}")
-    r.raise_for_status()
-    return r.json()
-
-# ---------- PROJECTS ----------
-
-@mcp.tool()
-async def list_projects(visibility: Optional[int] = None) -> dict:
-    """List projects. Accessible to all authenticated users."""
-    params = {"filter[visibility]": visibility} if visibility is not None else {}
-    r = await tc.get("/projects/range", params=params)
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def get_project_by_id(project_id: str) -> dict:
-    """Get a project by ID."""
-    r = await tc.get(f"/projects/range/{project_id}")
-    r.raise_for_status()
-    return r.json()
-
-@mcp.tool()
-async def search_projects(query: str) -> dict:
-    """Search projects."""
-    check_injection(query, "query")
-    r = await tc.get(f"/projects/range/search/{query}")
-    r.raise_for_status()
-    return r.json()
-
-# ============== Auth middleware ==============
-# Validates JWT Bearer token on every MCP request and populates the context var.
-
-class JWTAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Allow unauthenticated access to discovery / health
-        if request.url.path in ("/health",) or request.url.path.startswith("/.well-known"):
-            return await call_next(request)
-
-        auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer "):
-            return JSONResponse({"error": "missing bearer token"}, status_code=401)
-
-        token = auth[7:]
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            username = payload.get("sub")
-            if not username or username not in USERS_DB:
-                return JSONResponse({"error": "invalid token"}, status_code=401)
-            if payload.get("type") == "temp":
-                return JSONResponse({"error": "2FA not completed"}, status_code=401)
-        except JWTError:
-            return JSONResponse({"error": "invalid token"}, status_code=401)
-
-        user_record = USERS_DB[username]
-        token_ctx = current_user_ctx.set({"username": username, **user_record})
-        try:
-            response = await call_next(request)
-        finally:
-            current_user_ctx.reset(token_ctx)
-        return response
-
-# ============== Mount as ASGI app ==============
-app = mcp.streamable_http_app()
-app.add_middleware(JWTAuthMiddleware)
-
-@app.route("/health")
-async def health(request):
-    return JSONResponse({"status": "ok", "users": list(USERS_DB.keys())})
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Run
+# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    print(f"🚀 SecureHR MCP server on :{port}/mcp")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # FastMCP exposes a Starlette/ASGI app via .http_app() for SSE transport
+    app = mcp.http_app()
+    print(f"🚀 SecureHR MCP Server starting on port {MCP_PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=MCP_PORT)
