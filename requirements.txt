@@ -22,4 +22,4 @@ python-dotenv>=1.0.0
 pydantic>=2.5.3
 
 # Anthropic SDK — must be >= 0.43 for mcp_servers beta parameter
-anthropic>=0.43.0
+anthropic>=0.43.0fastmcp>=2.6.0
