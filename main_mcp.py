@@ -559,9 +559,10 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
     upload_type      = None
 
     # ── Claude call with MCP ─────────────────────────────────────────────────
-    # We use the betas parameter for mcp_servers support.
+    # With mcp_servers, the Anthropic API handles tool execution server-side.
+    # Claude will call MCP tools automatically and return a final text response.
     response = client.beta.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=4096,
         system=system_prompt,
         messages=messages,
@@ -569,54 +570,56 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
         betas=["mcp-client-2025-04-04"],
     )
 
-    # Agentic loop — MCP tool use is handled server-side by the Anthropic API,
-    # but we still collect tool_use blocks for logging / upload detection.
-    while response.stop_reason in ("tool_use", "end_turn"):
-        if response.stop_reason == "end_turn":
-            break
+    # Collect tool call info for logging/upload detection
+    # With server-side MCP, the response may contain mcp_tool_use blocks
+    for block in response.content:
+        block_type = getattr(block, "type", "")
+        if block_type in ("tool_use", "mcp_tool_use"):
+            tool_calls_made.append({
+                "tool": getattr(block, "name", "unknown"),
+                "input": getattr(block, "input", {})
+            })
+            if getattr(block, "name", "") == "request_passport_upload":
+                requires_upload = True
+                upload_type = "passport"
 
+    # If Claude stopped for tool_use (non-MCP), handle it
+    while response.stop_reason == "tool_use":
         tool_results = []
         for block in response.content:
-            if block.type == "tool_use":
-                tool_calls_made.append({"tool": block.name, "input": block.input})
+            if getattr(block, "type", "") == "tool_use":
                 if block.name == "request_passport_upload":
                     requires_upload = True
-                    upload_type     = "passport"
-                    # Return a synthetic result so Claude knows to ask for the upload
+                    upload_type = "passport"
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": json.dumps({
                             "action": "request_upload",
                             "upload_type": "passport",
-                            "message": "Please upload a photo of your passport for address verification.",
+                            "message": "Please upload a photo of your passport.",
                         }),
                     })
-            elif block.type == "mcp_tool_use":
-                # MCP tools are executed by the Anthropic API — log them only
-                tool_calls_made.append({"tool": block.name, "input": block.input})
-                if block.name == "request_passport_upload":
-                    requires_upload = True
-                    upload_type     = "passport"
 
-        if not tool_results and response.stop_reason == "tool_use":
-            # All tool calls were MCP (handled server-side); continue the loop
-            messages.append({"role": "assistant", "content": response.content})
-            response = client.beta.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                system=system_prompt,
-                messages=messages,
-                mcp_servers=mcp_servers,
-                betas=["mcp-client-2025-04-04"],
-            )
-            continue
+        if not tool_results:
+            break
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+        response = client.beta.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+            mcp_servers=mcp_servers,
+            betas=["mcp-client-2025-04-04"],
+        )
 
         if tool_results:
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
             response = client.beta.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-5",
                 max_tokens=4096,
                 system=system_prompt,
                 messages=messages,
@@ -675,7 +678,7 @@ async def verify_passport(
 
     client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=1024,
         messages=[{
             "role": "user",
