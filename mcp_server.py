@@ -469,6 +469,8 @@ async def get_employee_time_balances(
 # ══════════════════════════════════════════════════════════════════════════════
 # Run
 # ══════════════════════════════════════════════════════════════════════════════
+mcp_app = mcp.http_app()
+
 if __name__ == "__main__":
     import uvicorn
     # FastMCP exposes a Starlette/ASGI app via .http_app() for SSE transport
