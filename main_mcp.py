@@ -612,19 +612,6 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
             system=system_prompt,
             messages=messages,
             mcp_servers=mcp_servers,
-            betas=["mcp-client-2025-04-04"],
-        )
-
-        if tool_results:
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-            response = client.beta.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=4096,
-                system=system_prompt,
-                messages=messages,
-                mcp_servers=mcp_servers,
-                betas=["mcp-client-2025-04-04"],
             )
 
     final_text = "".join(
