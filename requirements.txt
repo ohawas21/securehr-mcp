@@ -1,0 +1,25 @@
+# SecureHR Main App — requirements
+# Deploy this as a SEPARATE Railway service running main_mcp.py
+
+# Core Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# HTTP Client (for passport-verify direct call to Timecount)
+httpx>=0.26.0
+
+# Authentication & Security
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+pyotp>=2.9.0
+qrcode[pil]>=7.4.2
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Validation
+pydantic>=2.5.3
+
+# Anthropic SDK — must be >= 0.43 for mcp_servers beta parameter
+anthropic>=0.43.0
