@@ -549,7 +549,7 @@ async def chat(request: ChatRequest, username: str = Depends(get_current_user)):
     mcp_servers = [
         {
             "type": "url",
-            "url": f"{TIMECOUNT_MCP_URL.rstrip('/')}/sse",
+            "url": f"{TIMECOUNT_MCP_URL.rstrip('/')}/mcp",
             "name": "timecount",
         }
     ]
